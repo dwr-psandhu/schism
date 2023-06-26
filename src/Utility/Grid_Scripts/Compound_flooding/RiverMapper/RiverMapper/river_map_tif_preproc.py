@@ -1,35 +1,114 @@
-# %%
+"""
+This script provides classes and methods for processing tif files.
+"""
+
+
+import os
+import errno
+import copy
+import numpy as np
+import pickle
 import json
+import time
+import math
+from dataclasses import dataclass
 from osgeo import gdal
 from glob import glob
-import copy
-from RiverMapper.make_river_map import Tif2XYZ, get_all_points_from_shp
-import numpy as np
-import os
-from RiverMapper.SMS import lonlat2cpp, cpp2lonlat
-import pickle
-import math
+from RiverMapper.SMS import lonlat2cpp, cpp2lonlat, get_all_points_from_shp
+from RiverMapper.util import silentremove
+
+
+@dataclass
+class dem_data():
+    x: np.ndarray
+    y: np.ndarray
+    lon: np.ndarray
+    lat: np.ndarray
+    elev: np.ndarray
+    dx: float
+    dy: float
+
 
 def parse_dem_tiles(dem_code, dem_tile_digits):
+    '''
+    Parse a dem_code into the original DEM id.
+    A unique code is assigned to all parent tiles (from the same DEM source) of a thalweg, e.g.:
+    327328329 is actually Tile No. 327, 328, 329
+    Almost all thalwegs only have <=4 parent tiles (when it is near the intersection point);
+    n_tiles > 4 will generate an exception.
+    '''
     if dem_code == 0:
         return [-1]  # no DEM found
 
     dem_tile_ids = []
     n_tiles = int(math.log10(dem_code)/dem_tile_digits) + 1
     if n_tiles > 4:
-        raise Exception("Some thalweg points belong to more than 4 tiles from one DEM source, clean up the DEM tiles first.")
+        raise ValueError("Some thalweg points belong to more than 4 tiles from one DEM source, you may need to clean up the DEM tiles first.")
     for digit in reversed(range(n_tiles)):
         x, dem_code = divmod(dem_code, 10**(digit*dem_tile_digits))
         dem_tile_ids.append(int(x-1))
     return dem_tile_ids
 
-def get_tif_boxes(tif_files:list, dem_cache=True):
-    tif_box = []
-    for i, tif_file in enumerate(tif_files):
-        print(f'reading tifs: {i+1} of {len(tif_files)}, {tif_file}')
-        tif = Tif2XYZ(tif_file, dem_cache)
-        tif_box.append([min(tif.x), min(tif.y), max(tif.x), max(tif.y)])
-    return tif_box
+def get_tif_box(tif_fname=None):
+    src = gdal.Open(tif_fname)
+    ulx, xres, xskew, uly, yskew, yres  = src.GetGeoTransform()
+    lrx = ulx + (src.RasterXSize * xres)
+    lry = uly + (src.RasterYSize * yres)
+    return [ulx, lry, lrx, uly]
+
+def Tif2XYZ(tif_fname=None, cache=True):
+    is_new_cache = False
+
+    cache_name = tif_fname + '.pkl'
+
+    if cache:
+        try:
+            with open(cache_name, 'rb') as f:
+                S = pickle.load(f)
+                return [S, is_new_cache]  # cache successfully read
+        except (ModuleNotFoundError, AttributeError) as e:
+            # remove existing cache if failing to read from it
+            silentremove(cache_name)
+        except OSError as e:
+            if e.errno != errno.ENOENT: # errno.ENOENT = no such file or directory
+                raise e
+
+    # read from raw tif and generate cache
+    ds = gdal.Open(tif_fname, gdal.GA_ReadOnly)
+    band = ds.GetRasterBand(1)
+
+    width = ds.RasterXSize
+    height = ds.RasterYSize
+
+    gt = ds.GetGeoTransform()
+    TL_x, TL_y = gt[0], gt[3]
+
+    #showing a 2D image of the topo
+    # plt.imshow(elevation, cmap='gist_earth',extent=[minX, maxX, minY, maxY])
+    # plt.show()
+
+    z = band.ReadAsArray()
+
+    dx = gt[1]
+    dy = gt[5]
+    if gt[2] != 0 or gt[4] != 0:
+        raise ValueError()
+
+    x_idx = np.array(range(width))
+    y_idx = np.array(range(height))
+    xp = dx * x_idx + TL_x + dx/2
+    yp = dy * y_idx + TL_y + dy/2
+
+    ds = None  # close dataset
+
+    S = dem_data(xp, yp, xp, yp, z, dx, dy)
+
+    if cache:
+        with open(cache_name, 'wb') as f:
+            pickle.dump(S, f, protocol=pickle.HIGHEST_PROTOCOL)
+        is_new_cache = True
+
+    return [S, is_new_cache]  # already_cached = False
 
 def reproject_tifs(tif_files:list, srcSRS='EPSG:4326', dstSRS='EPSG:26917', outdir='./'):
     '''
@@ -49,6 +128,40 @@ def pts_in_box(pts, box):
     in_box = (pts[:, 0] >  box[0]) * (pts[:, 0] <= box[2]) * \
              (pts[:, 1] >  box[1]) * (pts[:, 1] <= box[3])
     return in_box
+
+def Sidx(S, lon, lat):
+    '''
+    return nearest index (i, j) in DEM mesh for point (x, y),
+    assuming lon/lat, not projected coordinates
+    '''
+    dSx = S.lon[1] - S.lon[0]
+    dSy = S.lat[1] - S.lat[0]
+    i = (np.round((lon - S.lon[0]) / dSx)).astype(int)
+    j = (np.round((lat - S.lat[0]) / dSy)).astype(int)
+
+    valid = (i < S.lon.shape) * (j < S.lat.shape) * (i >= 0) * (j >= 0)
+    return [i, j], valid
+
+def get_elev_from_tiles(x_cpp, y_cpp, tile_list):
+    '''
+    x: vector of x coordinates, assuming cpp;
+    y: vector of x coordinates, assuming cpp;
+    tile_list: list of DEM tiles (in dem_data type, defined in river_map_tif_preproc)
+    '''
+
+    lon, lat = cpp2lonlat(x_cpp, y_cpp)
+
+    elevs = np.empty(lon.shape, dtype=float); elevs.fill(np.nan)
+    for S in tile_list:
+        [j, i], in_box = Sidx(S, lon, lat)
+        idx = (np.isnan(elevs) * in_box).astype(bool)  # only update valid entries that are not already set (i.e. nan at this step) and in DEM box
+        elevs[idx] = S.elev[i[idx], j[idx]]
+
+    if np.isnan(elevs).any():
+        # raise ValueError('failed to find elevation')
+        return None
+    else:
+        return elevs
 
 def find_parent_box(pts, boxes, i_overlap=False):
     ndigits = int(math.log10(len(boxes))) + 1  # number of digits needed for representing tile id, e.g., CuDEM (819 tiles) needs 3 digits
@@ -76,7 +189,7 @@ def find_thalweg_tile(
     thalweg_shp_fname='/sciclone/schism10/feiye/STOFS3D-v5/Inputs/v14/GA_riverstreams_cleaned_utm17N.shp',
     thalweg_buffer=1000,
     cache_folder=None,
-    iNoPrint=True, i_DEM_cache=True, i_thalweg_cache=True
+    iNoPrint=True, i_thalweg_cache=False
 ):
     '''
     Assign thalwegs to DEM tiles
@@ -88,31 +201,13 @@ def find_thalweg_tile(
     # get the box of each tile of each DEM
     dem_order = []
     for k, v in dem_dict.items():
-        if not iNoPrint: print(f"reading dem: {dem_dict[k]['name']}")
+        if not iNoPrint: print(f"reading dem bounding box: {dem_dict[k]['name']}")
         dem_order.append(k)
         if cache_folder is None:
             cache_folder = os.path.dirname(os.path.abspath(dem_dict[k]['glob_pattern']))  # same as *.shp's folder
-        cache_name =  cache_folder + \
-            '/' + dem_dict[k]['name'] + '.cache'
-        # Remove the existing cache if i_DEM_cache is False,
-        # this assumes the cache file needs to be updated
-        if (not i_DEM_cache) and os.path.exists(cache_name): os.remove(cache_name)
 
-        if i_DEM_cache and os.path.exists(cache_name):
-            if not iNoPrint: print(f"cache read for dem: {dem_dict[k]['name']}")
-            with open(cache_name, 'rb') as file:
-                tmp_dict = pickle.load(file)
-                dem_dict[k]['file_list'] = tmp_dict['file_list']
-                dem_dict[k]['boxes'] = tmp_dict['boxes']
-        else:
-            dem_dict[k]['file_list'] = glob(dem_dict[k]['glob_pattern'])
-            dem_dict[k]['boxes'] = get_tif_boxes(dem_dict[k]['file_list'], dem_cache=i_DEM_cache)
-            tmp_dict = {
-                'file_list': dem_dict[k]['file_list'],
-                'boxes': dem_dict[k]['boxes']
-            }
-            with open(cache_name, 'wb') as file:
-                pickle.dump(tmp_dict, file)
+        dem_dict[k]['file_list'] = glob(dem_dict[k]['glob_pattern'])
+        dem_dict[k]['boxes'] = [get_tif_box(x) for x in dem_dict[k]['file_list']]
 
     # read thalwegs
     print(f'Reading thalwegs from {thalweg_shp_fname} ...')
@@ -215,35 +310,3 @@ def find_thalweg_tile(
     # plt.show()
 
     return thalweg2large_group, large_groups_files, np.array(large_group2thalwegs, dtype=object)
-
-if __name__ == "__main__":
-    # find_thalweg_tile()
-    # %%
-    # Reproject
-    # tif_files = glob(f'/sciclone/schism10/feiye/STOFS3D-v5/Inputs/v14/GA_parallel/CRM/Lonlat/*.tif')
-    # reproject_tifs(tif_files, 'EPSG:26917', outdir='/sciclone/schism10/feiye/STOFS3D-v5/Inputs/v14/GA_parallel/CRM/UTM17/')
-
-    # Merge small coned tiles into larger ones (similar to CuDEM's tile size)
-    # cudem_files = glob(f'/sciclone/schism10/feiye/STOFS3D-v5/Inputs/v14/GA_parallel/CuDEM/*.tif')
-    # cudem_boxes = get_tif_boxes(cudem_files)
-
-    # coned_files = glob(f'/sciclone/schism10/feiye/STOFS3D-v5/Inputs/v14/GA_parallel/CoNED/Original/*.tif')
-    # coned_boxes = get_tif_boxes(coned_files)
-
-    # coned_centers = np.c_[
-    #     (np.array(coned_boxes)[:, 0]+np.array(coned_boxes)[:, 2])/2,
-    #     (np.array(coned_boxes)[:, 1]+np.array(coned_boxes)[:, 3])/2,
-    # ]
-
-    # for i, cudem_box in enumerate(cudem_boxes):
-    #     in_box = (coned_centers[:, 0] >  cudem_box[0]) * \
-    #              (coned_centers[:, 0] <= cudem_box[2]) * \
-    #              (coned_centers[:, 1] >  cudem_box[1]) * \
-    #              (coned_centers[:, 1] <= cudem_box[3])
-    #     in_box_files = (np.array(coned_files)[in_box]).tolist()
-    #     g = gdal.Warp(f"/sciclone/schism10/feiye/STOFS3D-v5/Inputs/v14/GA_parallel/CoNED/Combined/GA_CoNED_merged_{i}.tif",
-    #                   in_box_files, format="GTiff", options=["COMPRESS=LZW", "TILED=YES"])
-    #     g = None # Close file and flush to disk
-
-    pass
-

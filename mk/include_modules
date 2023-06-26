@@ -12,11 +12,19 @@
 # USE_PETSC = yes
 # EXEC := $(EXEC)_PETSC
 
+# Coupling with atmospheric model via ESMF
+# USE_ATMOS = yes
+# EXEC := $(EXEC)_EVAP
+
+# Use NWM BMI for source and some b.c.
+# USE_NWM_BMI = yes
+# EXEC := $(EXEC)_EVAP
+
 # Precip/evaporation model
 # USE_PREC_EVAP = yes
 # EXEC := $(EXEC)_EVAP
 
-# Impose net satl/heat fluxes in sflux*.nc
+# Impose net salt/heat fluxes in sflux*.nc (will be eventually removed)
 # IMPOSE_NET_FLUX = yes
 # EXEC := $(EXEC)_IMPOSE_NET_FLUX
 

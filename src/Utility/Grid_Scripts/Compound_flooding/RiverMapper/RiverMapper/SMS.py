@@ -1,3 +1,9 @@
+#!/usr/bin/env python
+"""
+This script provides methods of dealing with SMS maps for RiverMapper
+"""
+
+
 from logging import raiseExceptions
 import pickle
 import os
@@ -9,7 +15,7 @@ import numpy as np
 import re
 import shapefile
 import geopandas as gpd
-from pathlib import Path
+from RiverMapper.util import silentremove
 
 
 def lonlat2cpp(lon, lat, lon0=0, lat0=0):
@@ -25,14 +31,25 @@ def lonlat2cpp(lon, lat, lon0=0, lat0=0):
 
 def dl_cpp2lonlat(dl, lat0=0):
     R = 6378206.4
-
     lat0_radian = lat0/180*np.pi
-
     dlon_radian = dl/R/np.cos(lat0_radian)
-
     dlon = dlon_radian*180/np.pi
-
     return dlon
+
+    # x0 = 0.0
+    # x1 = dl
+    # y0 = 0.0
+    # y1 = 0.0
+    # lon0, lat0 = cpp2lonlat(x0, y0)
+    # lon1, lat1 = cpp2lonlat(x1, y1)
+    # return abs((lon0-lon1)+1j*(lat0-lat1))
+
+def dl_lonlat2cpp(dl, lat0=0):
+    R = 6378206.4
+    lat0_radian = lat0/180*np.pi
+    dl_radian = dl * np.pi / 180
+    dl_cpp = dl_radian * R * np.cos(lat0_radian)
+    return dl_cpp
 
 def cpp2lonlat(x, y, lon0=0, lat0=0):
     R = 6378206.4
@@ -45,6 +62,32 @@ def cpp2lonlat(x, y, lon0=0, lat0=0):
     lon, lat = lon_radian*180/np.pi, lat_radian*180/np.pi
 
     return [lon, lat]
+
+def curvature(pts):
+    if len(pts[:, 0]) < 3:
+        cur = np.zeros((len(pts[:, 0])))
+    else:
+        dx = np.gradient(pts[:,0]) # first derivatives
+        dy = np.gradient(pts[:,1])
+
+        d2x = np.gradient(dx) #second derivatives
+        d2y = np.gradient(dy)
+
+        cur = np.abs(dx * d2y - d2x * dy) / ((dx * dx + dy * dy)**1.5 + 1e-20)
+
+    return cur
+
+def get_perpendicular_angle(line):
+    line_cplx = np.squeeze(line.copy().view(np.complex128))
+    angles = np.angle(np.diff(line_cplx))
+    angle_diff0 = np.diff(angles)
+    angle_diff = np.diff(angles)
+    angle_diff[angle_diff0 > np.pi] -= 2 * np.pi
+    angle_diff[angle_diff0 < -np.pi] += 2 * np.pi
+    perp = angles[:-1] + angle_diff / 2 - np.pi / 2
+    perp = np.r_[angles[0] - np.pi / 2, perp, angles[-1] - np.pi / 2]
+
+    return perp
 
 def normalizeVec(x, y):
     distance = np.sqrt(x*x+y*y)
@@ -169,28 +212,38 @@ LEND
 '''
 
 def merge_maps(mapfile_glob_str, merged_fname):
+    if merged_fname is not None:
+        silentremove(merged_fname)
+
     map_file_list = glob.glob(mapfile_glob_str)
     if len(map_file_list) > 0:
-        map_objects = [SMS_MAP(filename=map_file) for map_file in map_file_list]
+        map_list = [SMS_MAP(filename=map_file) for map_file in map_file_list]
 
-        total_map = map_objects[0]
-        for map_object in map_objects[1:]:
-            total_map += map_object
+        total_map = map_list[0]
+        for map in map_list[1:]:
+            total_map += map
         total_map.writer(merged_fname)
     else:
-        print(f'failed to combine {mapfile_glob_str}, no files found')
+        print(f'warning: outputs do not exist: {mapfile_glob_str}, abort writing to map')
+        return None
+
+    return total_map
 
 
 class SMS_ARC():
     '''class for manipulating arcs in SMS maps'''
-    def __init__(self, points=None, node_idx=[0, -1], src_prj=None, dst_prj='epsg:4326'):
+    def __init__(self, points=None, node_idx=None, src_prj=None, dst_prj='epsg:4326'):
         # self.isDummy = (len(points) == 0)
+        if node_idx is None:
+            node_idx = [0, -1]
 
         if src_prj is None:
             raise Exception('source projection not specified when initializing SMS_ARC')
 
         if src_prj == 'cpp' and dst_prj == 'epsg:4326':
             points[:, 0], points[: ,1] = cpp2lonlat(points[:, 0], points[: ,1])
+            if points.shape[1] == 3:
+                points[:, 2] = dl_cpp2lonlat(points[:, 2], lat0=points[:, 1])
 
         npoints, ncol = points.shape
         self.points = np.zeros((npoints, 3), dtype=float)
@@ -235,7 +288,12 @@ class SMS_ARC():
 
 class SMS_MAP():
     '''class for manipulating SMS maps'''
-    def __init__(self, filename=None, arcs=[], detached_nodes=[], epsg=4326):
+    def __init__(self, filename=None, arcs=None, detached_nodes=None, epsg=4326):
+        if arcs is None:
+            arcs = []
+        if detached_nodes is None:
+            detached_nodes = []
+
         self.epsg = None
         self.arcs = []
         self.nodes = np.zeros((0, 3))
@@ -325,7 +383,7 @@ class SMS_MAP():
         import os
 
         if not self.valid:
-            print(f'No arcs found in map, aborting writing to *.map')
+            print(f'No arcs found in map, aborting writing to {filename}')
             return
 
         fpath = os.path.dirname(filename)
@@ -366,7 +424,7 @@ class SMS_MAP():
             for i, node in enumerate(self.detached_nodes):
                 node_counter += 1
                 f.write('POINT\n')
-                f.write(f'XY {node[0]} {node[1]} 0.0\n')
+                f.write(f'XY {node[0]} {node[1]} {node[2]}\n')
                 f.write(f'ID {node_counter}\n')
                 f.write('END\n')
 
@@ -385,14 +443,28 @@ class SMS_MAP():
             f.write('LEND\n')
             pass
 
+    def to_GeoDataFrame(self):
+        return gpd.GeoDataFrame(geometry=[LineString(line.points) for line in self.arcs if line is not None])
+
+    def to_LineStringList(self):
+        return [LineString(line.points) for line in self.arcs if line is not None]
+
 class Levee_SMS_MAP(SMS_MAP):
-    def __init__(self, arcs=[], epsg=4326):
+    def __init__(self, arcs=None, epsg=4326):
+        if arcs is None:
+            arcs = []
+
         super().__init__(arcs=arcs, epsg=epsg)
         self.centerline_list = arcs
         self.subsampled_centerline_list = []
         self.offsetline_list = []
 
-    def make_levee_maps(self, offset_list=[-5, 5, -15, 15], subsample=[300, 10]):
+    def make_levee_maps(self, offset_list=None, subsample=None):
+        if offset_list is None:
+            offset_list = [-5, 5, -15, 15]
+        if subsample is None:
+            subsample = [300, 10]
+
         for arc in self.centerline_list:
             x_sub, y_sub, _ = redistribute(x=arc.points[:, 0], y=arc.points[:, 1], length=subsample[0])
             self.subsampled_centerline_list.append(SMS_ARC(points=np.c_[x_sub, y_sub]))
@@ -402,45 +474,19 @@ class Levee_SMS_MAP(SMS_MAP):
                 self.offsetline_list.append(SMS_ARC(points=np.c_[x_off, y_off]))
         return SMS_MAP(arcs=self.subsampled_centerline_list), SMS_MAP(arcs=self.offsetline_list)
 
-def get_perpendicular_angle(line):
-    line_cplx = np.squeeze(line.copy().view(np.complex128))
-    angles = np.angle(np.diff(line_cplx))
-    angle_diff0 = np.diff(angles)
-    angle_diff = np.diff(angles)
-    angle_diff[angle_diff0 > np.pi] -= 2 * np.pi
-    angle_diff[angle_diff0 < -np.pi] += 2 * np.pi
-    perp = angles[:-1] + angle_diff / 2 - np.pi / 2
-    perp = np.r_[angles[0] - np.pi / 2, perp, angles[-1] - np.pi / 2]
-
-    return perp
-
-def curvature(pts):
-    if len(pts[:, 0]) < 3:
-        cur = np.zeros((len(pts[:, 0])))
-    else:
-        dx = np.gradient(pts[:,0]) # first derivatives
-        dy = np.gradient(pts[:,1])
-
-        d2x = np.gradient(dx) #second derivatives
-        d2y = np.gradient(dy)
-
-        cur = np.abs(dx * d2y - d2x * dy) / ((dx * dx + dy * dy)**1.5 + 1e-20)
-
-    return cur
-
 def get_all_points_from_shp(fname, iNoPrint=True, iCache=False, cache_folder=None):
     if not iNoPrint: print(f'reading shapefile: {fname}')
 
-    if cache_folder is None:
-        cache_folder = ''
+    # if cache_folder is None:
+    #     cache_folder = ''
 
-    cache_name = cache_folder + Path(fname).stem + '.pkl'
+    # cache_name = cache_folder + Path(fname).stem + '.pkl'
 
-    if iCache == False:
-        if os.path.exists(cache_name):
-            os.remove(cache_name)
+    # if iCache == False:
+    #     if os.path.exists(cache_name):
+    #         os.remove(cache_name)
 
-    if os.path.exists(cache_name):
+    if False:  # os.path.exists(cache_name):
         with open(cache_name, 'rb') as file:
             tmp_dict = pickle.load(file)
             xyz = tmp_dict['xyz']
@@ -528,9 +574,9 @@ def get_all_points_from_shp(fname, iNoPrint=True, iCache=False, cache_folder=Non
 
         # if not iNoPrint: print(f'Number of shapes read: {len(shapes)}')
 
-        with open(cache_name, 'wb') as file:
-            tmp_dict = {'xyz': xyz, 'shape_pts_l2g': shape_pts_l2g, 'curv': curv, 'perp': perp}
-            pickle.dump(tmp_dict, file)
+        # with open(cache_name, 'wb') as file:
+        #     tmp_dict = {'xyz': xyz, 'shape_pts_l2g': shape_pts_l2g, 'curv': curv, 'perp': perp}
+        #     pickle.dump(tmp_dict, file)
 
     return xyz, shape_pts_l2g, curv, perp
 

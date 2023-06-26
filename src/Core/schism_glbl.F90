@@ -93,7 +93,7 @@ module schism_glbl
                   &inv_atm_bnd,ieos_type,ieos_pres,iupwind_mom,inter_mom,ishapiro,isav, &
                   &nstep_ice,niter_shap,iunder_deep,flag_fib,ielm_transport,max_subcyc, &
                   &itransport_only,meth_sink,iloadtide,nc_out,nu_sum_mult,iprecip_off_bnd, &
-                  &iof_ugrid,iflux_out_format
+                  &iof_ugrid,iflux_out_format,model_type_pahm
   integer,save :: ntrs(natrm),nnu_pts(natrm),mnu_pts,lev_tr_source(natrm)
   integer,save,dimension(:),allocatable :: iof_hydro,iof_wwm,iof_gen,iof_age,iof_sed,iof_eco, &
      &iof_icm,iof_icm_core,iof_icm_silica,iof_icm_zb,iof_icm_ph,iof_icm_cbp,iof_icm_sav,iof_icm_veg, &
@@ -160,8 +160,9 @@ module schism_glbl
   character(len=16),save :: a_16
   character(len= 8),save :: a_8
   character(len= 4),save :: a_4
-  integer,save :: ncid_nu(natrm),ncid_tr3D(natrm),ncid_elev2D,ncid_uv3D, &
- &istack0_schout,ncid_source,ncid_schout(7),ncid_schout_2(7),nrec_schout,nstride_schout
+  integer,save :: ncid_nu(natrm),ncid_tr3D(natrm),ncid_elev2D,ncid_uv3D,irec0_schout, &
+ &istack0_schout,ncid_source,ncid_schout(7),ncid_schout_2(7),nrec_schout,nstride_schout, &
+ &ncid_atmos
         
   ! ADT for global-to-local linked-lists
   type :: llist_type
@@ -456,7 +457,7 @@ module schism_glbl
 !  real(rkind),save,allocatable :: shapiro_min(:)      !min of Shapiro filter strength (used with some ishapiro options)
   real(rkind),save,allocatable,target :: windx(:),windy(:) !wind vector
   real(rkind),save,allocatable,target :: prec_rain(:),prec_snow(:) !precipitation of rain and snow
-  real(rkind),save,allocatable,target :: sdbt(:,:,:),shapiro(:), &
+  real(rkind),save,allocatable,target :: sdbt(:,:,:),shapiro(:),shapiro_smag(:), &
                                   &windx1(:),windy1(:),windx2(:),windy2(:), &
                                   &surf_t1(:),surf_t2(:),surf_t(:), & !YC
                                   !WARNING: airt[12] are in C not K. The

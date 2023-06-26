@@ -16,10 +16,11 @@ A sample param.nml is always provided under your SCHISM source code directory:
 
 `$your_schism_dir/sample_inputs/param.nml`
 
-The latest master version can also be viewed on the [Github page](https://github.com/schism-dev/schism/blob/master/sample_inputs/param.nml).
+The latest master version for this input can also be viewed on the [Github page](https://github.com/schism-dev/schism/blob/master/sample_inputs/param.nml).
+Useful user info can be found in the source code bundle `src/Readme.beta_notes` (including change of format for input files and bug fixes).
 
 
-## SCHISM Modules
+## SCHISM Modules required in the test suite
 Depending on which verification test you are conducting, you may need to enable certain modules when compiling SCHISM.
 
 Here is a reference:
